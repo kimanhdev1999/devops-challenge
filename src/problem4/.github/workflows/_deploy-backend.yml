@@ -1,0 +1,93 @@
+name: _deploy-backend
+
+# Reusable: rolling deploy of one image digest to one environment, with automatic rollback.
+# Called by backend-deploy (staging, then production) and backend-rollback.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      image:
+        description: Full image reference pinned by digest (registry/repo@sha256:...)
+        type: string
+        required: true
+      version:
+        description: Git SHA the image was built from; /healthz must report it
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy backend to ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Production has required reviewers and a main-only branch rule in repo settings.
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.BACKEND_URL }}
+    concurrency:
+      group: backend-deploy-${{ inputs.environment }}
+      cancel-in-progress: false # never cancel a half-finished rollout
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Inputs reach shell through env, never ${{ }} inside run:, to rule out script injection.
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ inputs.version }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SSM_DOCUMENT: ${{ vars.BACKEND_SSM_DOCUMENT || 'Backend-Deploy' }}
+      TARGET_GROUP_ARN: ${{ vars.BACKEND_TARGET_GROUP_ARN }}
+      BACKEND_URL: ${{ vars.BACKEND_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: src/problem4/scripts
+
+      - name: Assume the ${{ inputs.environment }} deploy role (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-backend-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Remember what is live now (rollback target)
+        id: current
+        run: |
+          previous=$(aws ssm get-parameter --name "/app/backend/${ENVIRONMENT}/image" \
+            --query Parameter.Value --output text 2>/dev/null || true)
+          echo "image=${previous}" >> "$GITHUB_OUTPUT"
+          echo "Currently live: ${previous:-nothing recorded}"
+
+      - name: Rolling deploy, one instance at a time
+        run: src/problem4/scripts/ssm-rolling-deploy.sh "${IMAGE}"
+
+      - name: Smoke test through the load balancer
+        run: src/problem4/scripts/smoke-test-backend.sh "${BACKEND_URL}" "${VERSION}"
+
+      - name: Record the new live image (ASG scale-out uses it)
+        run: |
+          aws ssm put-parameter --name "/app/backend/${ENVIRONMENT}/image" \
+            --type String --value "${IMAGE}" --overwrite >/dev/null
+
+      - name: Roll back to the previous image
+        if: failure() && steps.current.outputs.image != '' && steps.current.outputs.image != inputs.image
+        env:
+          PREVIOUS: ${{ steps.current.outputs.image }}
+        run: |
+          echo "::error::deploy of ${VERSION} to ${ENVIRONMENT} failed; restoring ${PREVIOUS}"
+          src/problem4/scripts/ssm-rolling-deploy.sh "${PREVIOUS}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Backend → ${ENVIRONMENT}: ${{ job.status }}"
+            echo "- version: \`${VERSION}\`"
+            echo "- image: \`${IMAGE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,98 @@
+name: backend-deploy
+
+# main → test → build image once → staging → (approval) → production.
+# Both environments run the same image digest.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/problem4/backend/**"
+      - "src/problem4/scripts/ssm-rolling-deploy.sh"
+      - "src/problem4/scripts/smoke-test-backend.sh"
+      - ".github/workflows/backend-deploy.yml"
+      - ".github/workflows/_deploy-backend.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+# One release in flight at a time; a newer push waits rather than interrupting a rollout.
+concurrency:
+  group: backend-release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/backend-ci.yml
+    with:
+      build-image: false
+    permissions:
+      contents: read
+
+  build:
+    name: Build, scan and push image
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
+          role-session-name: gha-ecr-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: false # the image URI (which contains it) must pass between jobs
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src/problem4/backend
+          push: true
+          # Tag = commit SHA; the ECR repo has immutable tags, so a tag can never be repointed.
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          build-args: APP_VERSION=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - id: ref
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}
+        run: echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+      - name: Scan the pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  staging:
+    needs: build
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: staging
+      image: ${{ needs.build.outputs.image }}
+      version: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write
+
+  production:
+    needs: [build, staging]
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: production
+      image: ${{ needs.build.outputs.image }}
+      version: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write

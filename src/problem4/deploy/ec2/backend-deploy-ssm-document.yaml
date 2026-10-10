@@ -1,0 +1,19 @@
+# SSM Command document "Backend-Deploy" (provisioned with Terraform, not by the pipeline).
+# allowedPattern rejects anything that is not an ECR image or target-group ARN, so a
+# compromised caller cannot inject shell through the parameters.
+schemaVersion: "2.2"
+description: Drain, replace and health-check the backend container on one instance.
+parameters:
+  ImageUri:
+    type: String
+    allowedPattern: '^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9/_-]+@sha256:[a-f0-9]{64}$'
+  TargetGroupArn:
+    type: String
+    allowedPattern: '^arn:aws:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:targetgroup/[A-Za-z0-9-]+/[a-f0-9]+$'
+mainSteps:
+  - action: aws:runShellScript
+    name: deploy
+    inputs:
+      timeoutSeconds: "900"
+      runCommand:
+        - /opt/backend/deploy.sh "{{ ImageUri }}" "{{ TargetGroupArn }}"

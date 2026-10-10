@@ -1,0 +1,78 @@
+name: backend-ci
+
+# Pull requests get the full gate. The deploy workflow reuses the same gate on main
+# (build-image: false, because it builds and scans the real image itself).
+on:
+  pull_request:
+    paths:
+      - "src/problem4/backend/**"
+      - ".github/workflows/backend-ci.yml"
+  workflow_call:
+    inputs:
+      build-image:
+        description: Build and scan a throwaway image (the deploy workflow builds the real one)
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: backend-ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: src/problem4/backend
+
+jobs:
+  test:
+    name: Lint, test, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: src/problem4/backend/.nvmrc
+          cache: npm
+          cache-dependency-path: src/problem4/backend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - name: Fail on known high/critical vulnerabilities in runtime deps
+        run: npm audit --omit=dev --audit-level=high
+
+  image:
+    name: Build and scan image
+    needs: test
+    if: ${{ github.event_name == 'pull_request' || inputs.build-image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src/problem4/backend
+          load: true
+          push: false
+          tags: backend:ci
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Scan image for fixable HIGH/CRITICAL CVEs
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: backend:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
