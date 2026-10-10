@@ -18,7 +18,9 @@ A design for a crypto exchange's order-matching platform on AWS. Every order is 
 
 ## Overview
 
-**Requirements assumed**
+**Features covered.** Out of Binance's feature set this design focuses on spot trading: placing and cancelling limit and market orders, price-time matching, live market data (trades and order-book depth over WebSocket), and the balance ledger that settles fills. Accounts and auth are included only as far as the order path needs them. Futures, margin, staking, fiat on-ramps and custody are out of scope; custody is added in Problem 5.
+
+**Requirements** (from the challenge brief, with the HA and correctness targets added as assumptions)
 
 | Requirement | Target |
 | --- | --- |
