@@ -1,0 +1,39 @@
+name: frontend-rollback
+
+# Republish an archived release. Its hashed assets are still in the bucket, so this is
+# effectively an index.html swap and takes about a minute.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: Full git SHA of the release to restore
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - run: |
+          [[ "${VERSION}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full 40-char git SHA"; exit 1; }
+
+  deploy:
+    needs: validate
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ inputs.version }}
+      source: release
+    permissions:
+      contents: read
+      id-token: write

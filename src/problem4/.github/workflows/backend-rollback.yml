@@ -1,0 +1,58 @@
+name: backend-rollback
+
+# Redeploy any image previously built by backend-deploy. Production still needs approval.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: Full git SHA of the release to restore
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: Resolve image for ${{ inputs.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.find.outputs.image }}
+    env:
+      VERSION: ${{ inputs.version }}
+      REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+    steps:
+      - name: Validate input
+        run: |
+          [[ "${VERSION}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full 40-char git SHA"; exit 1; }
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
+          role-session-name: gha-rollback-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: false
+      - id: find
+        run: |
+          digest=$(aws ecr describe-images --repository-name "${REPOSITORY}" \
+            --image-ids imageTag="${VERSION}" --query 'imageDetails[0].imageDigest' --output text)
+          registry=$(aws ecr describe-repositories --repository-names "${REPOSITORY}" \
+            --query 'repositories[0].repositoryUri' --output text)
+          echo "image=${registry}@${digest}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: resolve
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image: ${{ needs.resolve.outputs.image }}
+      version: ${{ inputs.version }}
+    permissions:
+      contents: read
+      id-token: write

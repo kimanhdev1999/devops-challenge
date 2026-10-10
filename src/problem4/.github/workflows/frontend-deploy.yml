@@ -1,0 +1,45 @@
+name: frontend-deploy
+
+# main → test + build once → staging → (approval) → production, same bundle everywhere.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/problem4/frontend/**"
+      - "src/problem4/scripts/publish-frontend.sh"
+      - "src/problem4/scripts/smoke-test-frontend.sh"
+      - ".github/workflows/frontend-deploy.yml"
+      - ".github/workflows/_deploy-frontend.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: frontend-release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/frontend-ci.yml
+    permissions:
+      contents: read
+
+  staging:
+    needs: ci
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: staging
+      version: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write
+
+  production:
+    needs: staging
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: production
+      version: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write

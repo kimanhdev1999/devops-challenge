@@ -1,0 +1,32 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunOnlyTheDeployDocument",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:document/Backend-Deploy"
+    },
+    {
+      "Sid": "OnlyOnBackendInstancesOfThisEnvironment",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/Service": "backend", "aws:ResourceTag/Environment": "<ENVIRONMENT>" }
+      }
+    },
+    {
+      "Sid": "TrackDeployProgress",
+      "Effect": "Allow",
+      "Action": ["ssm:ListCommands", "ssm:ListCommandInvocations", "ssm:GetCommandInvocation"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CurrentImagePointer",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/app/backend/<ENVIRONMENT>/*"
+    }
+  ]
+}
