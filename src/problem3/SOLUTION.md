@@ -8,7 +8,8 @@ The API was unreliable for two reasons. NGINX proxied to the wrong port, so ever
 
 1. Ran the stack as given and probed every route with `curl`, reading `docker compose logs nginx`.
 2. Called the API directly inside its container (`docker exec api wget localhost:3000/...`) to separate NGINX problems from API problems.
-3. Injected the failures a real environment sees: `docker restart postgres`, `docker stop redis`, `docker pause postgres` (a hung database), and recreating the API container.
+3. Injected the failures a real environment sees: `docker restart postgres`, `docker stop redis`, `docker pause postgres` (a hung database), recreating the API container on a new IP, and a cold start on an empty Postgres volume.
+   Issue #1 masks #8 (every request is already a 502), so #8 was tested on a copy of the original with only the port changed.
 4. Read the code and configs for problems that don't show up on a happy-path run.
 
 ## Issues found
@@ -19,10 +20,10 @@ The API was unreliable for two reasons. NGINX proxied to the wrong port, so ever
 | 2 | No `pool.on('error')` handler in the API | `docker restart postgres` → API container **exited (1)**: `error: terminating connection due to administrator command` (unhandled `'error'` event) | One DB restart or failover kills the API |
 | 3 | No restart policy on any service | After #2 the API stayed down until manually started | Outage lasts until a human notices: "sometimes inaccessible" |
 | 4 | No connection or query timeout on the pg pool | `docker pause postgres` → request **hung >25 s** with no response | Requests pile up; NGINX returns 504 after 60 s; clients hang |
-| 5 | Client leak on query error: `db.release()` is skipped when `db.query()` throws | Code review: `connect()` → `query()` throws → jump to `catch`, client never released. After 10 failures (pool max) every request waits forever | Pool exhaustion → API hangs until restart |
+| 5 | Client leak on query error: `db.release()` is skipped when `db.query()` throws | `connect()` → `query()` throws → jump to `catch`, client never released. Reproduced with the handler's pattern and a failing query (pool `max: 3`): after 3 failures the pool is full and a good query was **still waiting after 5 s**. With the default `max: 10`, 10 failures hang every request | Pool exhaustion → API hangs until restart |
 | 6 | Request blocks on a non-essential Redis write | `docker stop redis` → `/api/users` took **10 s** then **500** (ioredis offline queue + 20 retries) | A cache outage takes down a DB-backed endpoint |
-| 7 | `depends_on` without health checks | API can start before Postgres accepts connections | First requests after a deploy fail |
-| 8 | NGINX resolves `api` once at startup | Static `proxy_pass` hostname is cached | If the API container is recreated with a new IP, NGINX keeps proxying to the old one (502) until it restarts |
+| 7 | `depends_on` without health checks | Cold start on an empty volume: API container started **70 ms** after Postgres, ~0.6 s before Postgres was ready; a request in that window → **500** (`ECONNREFUSED`) | First requests after a deploy fail (a longer window with a large database or crash recovery) |
+| 8 | NGINX resolves `api` once at startup | Original with only the port fixed: API recreated on a new IP (`.4` → `.6`, old IP taken by another container) → **502 for 20 s+**, while the API was healthy; **200** only after restarting NGINX | If the API container is recreated with a new IP, NGINX keeps proxying to the old one until it restarts |
 | 9 | `/status` health route not exposed through NGINX | `/status` → 404 | No way to health-check the API from outside |
 | 10 | `postgres/init.sql` (`max_connections = 20`) is never mounted | `docker inspect` shows no init mount; `SHOW max_connections` → 100 | Dead config. Had it been mounted it would cap Postgres at 20 connections, so it was removed, not wired up |
 | 11 | Empty `nginx/nginx.conf` | Not mounted | Mounting it would break NGINX; removed |
@@ -54,8 +55,12 @@ The API was unreliable for two reasons. NGINX proxied to the wrong port, so ever
 | `docker restart postgres` | API crashed, stayed down | API keeps running (0 restarts); next request **200** |
 | `docker stop redis` | 10 s, then 500 | `/api/users` **200** in 2 ms; `/ready` **503** naming Redis |
 | `docker pause postgres` (hung DB) | Hung indefinitely | **503 in 5 s** (bounded by `query_timeout`) |
-| Recreate the API container | (NGINX would hold the stale IP) | **200** straight away |
+| Pool leak: 15 failing queries, then a good one | Good query waits forever | Good query in 3 ms; pool idle, nothing waiting |
+| Recreate the API container on a **new IP** | 502 for 20 s+, until NGINX restarts (tested with only the port fixed) | **200** on the next request |
+| Cold start on an empty volume | API starts 70 ms after Postgres; early request → 500 | API starts only after Postgres is healthy (~5 s); first request **200**; 0 DB errors; NGINX up after the API is healthy (~10 s total) |
 | 500 requests, 50 concurrent | — | **500 × 200** |
+
+A plain `docker compose up -d --force-recreate api` usually hands the API its old IP back, so it passes even without the fix. To test #8, occupy the old IP first (e.g. stop the API and `docker run -d --network <project>_default alpine sleep 300`), then recreate.
 
 Run it: `docker compose up --build`, then `curl localhost:8080/api/users`.
 
