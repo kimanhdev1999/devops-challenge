@@ -23,6 +23,7 @@ jobs:
     uses: ./.github/workflows/frontend-ci.yml
     permissions:
       contents: read
+      id-token: write
 
   staging:
     needs: ci
@@ -40,6 +41,19 @@ jobs:
     with:
       environment: production
       version: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Any failure (gate, build, staging, production) → AWS DevOps Agent investigates it.
+  investigate:
+    needs: [ci, staging, production]
+    if: failure()
+    uses: ./.github/workflows/_investigate-failure.yml
+    with:
+      app: frontend
+      priority: ${{ needs.production.result == 'failure' && 'HIGH' || needs.staging.result == 'failure' && 'MEDIUM' || 'LOW' }}
+      results: ${{ toJSON(needs) }}
     permissions:
       contents: read
       id-token: write

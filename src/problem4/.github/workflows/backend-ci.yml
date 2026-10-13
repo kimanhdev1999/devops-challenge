@@ -31,10 +31,20 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write # read-only dependency cache role
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Use the dependency cache (CodeArtifact)
+        id: deps
+        uses: ./.github/actions/dependency-cache
+        with:
+          role-arn: ${{ vars.AWS_DEPS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          domain: ${{ vars.CODEARTIFACT_DOMAIN }}
+          domain-owner: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+          repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: src/problem4/backend/.nvmrc
@@ -54,10 +64,21 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      id-token: write # read-only dependency cache role
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Use the dependency cache (CodeArtifact, ECR pull-through)
+        id: deps
+        uses: ./.github/actions/dependency-cache
+        with:
+          role-arn: ${{ vars.AWS_DEPS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          domain: ${{ vars.CODEARTIFACT_DOMAIN }}
+          domain-owner: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+          repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
+          docker: "true"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build (not pushed)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -66,7 +87,10 @@ jobs:
           load: true
           push: false
           tags: backend:ci
-          build-args: APP_VERSION=${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            BASE_REGISTRY=${{ steps.deps.outputs.base-image-registry }}/docker/library
+          secret-files: npmrc=${{ steps.deps.outputs.npmrc }}
           cache-from: type=gha,scope=backend
           cache-to: type=gha,scope=backend,mode=max
       - name: Scan image for fixable HIGH/CRITICAL CVEs

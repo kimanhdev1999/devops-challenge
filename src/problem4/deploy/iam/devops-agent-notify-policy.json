@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadTheWebhookSecretOnly",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:<REGION>:<TOOLING_ACCOUNT_ID>:secret:devops-agent/github-actions-webhook-*"
+    }
+  ]
+}

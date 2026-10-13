@@ -11,6 +11,15 @@
         "ecr:DescribeImages"
       ],
       "Resource": "arn:aws:ecr:<REGION>:<TOOLING_ACCOUNT_ID>:repository/backend"
+    },
+    {
+      "Sid": "PullBaseImagesThroughCache",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
+        "ecr:CreateRepository", "ecr:BatchImportUpstreamImage"
+      ],
+      "Resource": "arn:aws:ecr:<REGION>:<TOOLING_ACCOUNT_ID>:repository/ecr-public/*"
     }
   ]
 }

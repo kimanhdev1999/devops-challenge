@@ -1,0 +1,72 @@
+name: _investigate-failure
+
+# Reusable: hand a failed release to AWS DevOps Agent, which investigates the root cause
+# (logs, deployments, metrics, recent changes) and posts its findings in the Agent Space.
+# Called with `if: failure()` from the release and rollback workflows. It only reports: the
+# deploy jobs have already rolled back, and the run stays red.
+on:
+  workflow_call:
+    inputs:
+      app:
+        type: string
+        required: true
+      priority:
+        description: CRITICAL, HIGH, MEDIUM, LOW or MINIMAL
+        type: string
+        required: true
+      results:
+        description: toJSON(needs) of the calling workflow
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  investigate:
+    name: Ask AWS DevOps Agent to investigate
+    runs-on: codebuild-gha-release-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: src/problem4/scripts
+
+      # This role can read one secret and nothing else, and trusts only runs on main.
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEVOPS_AGENT_ROLE_ARN }}
+          role-session-name: gha-devops-agent-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Load the webhook URL and signing secret
+        env:
+          SECRET_ID: ${{ vars.DEVOPS_AGENT_WEBHOOK_SECRET_ID || 'devops-agent/github-actions-webhook' }}
+        run: |
+          webhook=$(aws secretsmanager get-secret-value --secret-id "${SECRET_ID}" \
+            --query SecretString --output text)
+          secret=$(jq -r .secret <<<"${webhook}")
+          echo "::add-mask::${secret}"
+          {
+            echo "WEBHOOK_URL=$(jq -r .url <<<"${webhook}")"
+            echo "WEBHOOK_SECRET=${secret}"
+          } >> "$GITHUB_ENV"
+
+      - name: Start the investigation
+        env:
+          APP: ${{ inputs.app }}
+          PRIORITY: ${{ inputs.priority }}
+          RESULTS: ${{ inputs.results }}
+        run: src/problem4/scripts/notify-devops-agent.sh
+
+      - name: Summary
+        if: always()
+        env:
+          APP: ${{ inputs.app }}
+          PRIORITY: ${{ inputs.priority }}
+        run: |
+          echo "### AWS DevOps Agent: investigation of the ${APP} failure requested (${PRIORITY}), status ${{ job.status }}" \
+            >> "$GITHUB_STEP_SUMMARY"

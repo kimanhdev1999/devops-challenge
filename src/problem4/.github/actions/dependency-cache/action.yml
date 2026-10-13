@@ -1,0 +1,68 @@
+name: Use the dependency cache
+description: >
+  Point npm at the CodeArtifact npm repository and, optionally, log Docker in to the ECR
+  pull-through cache for base images. Uses the read-only gha-deps-read role (OIDC), so the
+  calling job needs `id-token: write`. See deploy/codebuild/dependency-cache.tf.
+
+inputs:
+  role-arn:
+    description: gha-deps-read role ARN (vars.AWS_DEPS_ROLE_ARN)
+    required: true
+  aws-region:
+    required: true
+  domain:
+    required: true
+  domain-owner:
+    required: true
+  repository:
+    required: true
+  docker:
+    description: Also log Docker in to the ECR pull-through cache
+    default: "false"
+
+outputs:
+  npmrc:
+    description: npmrc file holding the CodeArtifact registry and token (mount it into docker builds)
+    value: ${{ steps.npm.outputs.npmrc }}
+  base-image-registry:
+    description: Registry prefix for cached ECR Public images, e.g. <registry>/ecr-public/docker/library/node:22-alpine
+    value: ${{ steps.ecr.outputs.registry && format('{0}/ecr-public', steps.ecr.outputs.registry) || '' }}
+
+runs:
+  using: composite
+  steps:
+    - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        role-session-name: gha-deps-${{ github.run_id }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - id: npm
+      shell: bash
+      env:
+        DOMAIN: ${{ inputs.domain }}
+        DOMAIN_OWNER: ${{ inputs.domain-owner }}
+        REPOSITORY: ${{ inputs.repository }}
+      run: |
+        token=$(aws codeartifact get-authorization-token --domain "${DOMAIN}" \
+          --domain-owner "${DOMAIN_OWNER}" --duration-seconds 3600 \
+          --query authorizationToken --output text)
+        echo "::add-mask::${token}"
+        endpoint=$(aws codeartifact get-repository-endpoint --domain "${DOMAIN}" \
+          --domain-owner "${DOMAIN_OWNER}" --repository "${REPOSITORY}" --format npm \
+          --query repositoryEndpoint --output text)
+        npmrc="${RUNNER_TEMP}/codeartifact.npmrc"
+        umask 077
+        {
+          echo "registry=${endpoint}"
+          echo "//${endpoint#https://}:_authToken=${token}"
+        } > "${npmrc}"
+        # npm rewrites the registry.npmjs.org URLs in package-lock.json to this registry
+        # (replace-registry-host defaults to "npmjs"), so lockfiles need no change.
+        echo "NPM_CONFIG_USERCONFIG=${npmrc}" >> "$GITHUB_ENV"
+        echo "npmrc=${npmrc}" >> "$GITHUB_OUTPUT"
+        echo "npm registry: ${endpoint}"
+
+    - id: ecr
+      if: inputs.docker == 'true'
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
