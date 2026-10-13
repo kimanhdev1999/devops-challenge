@@ -13,6 +13,7 @@ A design for a crypto exchange's order-matching platform on AWS. Every order is 
 - [Component choices](#component-choices)
 - [High availability and disaster recovery](#high-availability-and-disaster-recovery)
 - [Scaling plan](#scaling-plan)
+- [Reliability: SLIs, SLOs and AI-assisted diagnosis](#reliability-slis-slos-and-ai-assisted-diagnosis)
 - [Security, operations and cost](#security-operations-and-cost)
 - [Diagrams](#diagrams)
 
@@ -49,7 +50,7 @@ Orders flow through one sequencing point per trading pair; the matching engine i
 | Public subnets | ALB (REST), NLB (WebSocket) |
 | Private subnets · EKS | Order API, matching engine (leader + standby), WebSocket gateway, ledger projector |
 | Private subnets · data | Amazon MSK, ElastiCache (Redis), Aurora PostgreSQL |
-| Regional services | S3, Athena, CloudWatch / AMP / Grafana / X-Ray, KMS, Secrets Manager |
+| Regional services | S3, Athena, CloudWatch / AMP / Grafana / X-Ray, AWS DevOps Agent, KMS, Secrets Manager |
 | Warm standby region | Aurora Global DB secondary, MSK Replicator target, S3 replica, scaled-down EKS |
 
 Stateless tiers (edge, Order API, WebSocket gateway, ledger projector) scale horizontally on EKS. The two stateful choke points, the `orders` partition and the engine that owns it, are protected by replication (`acks=all` across 3 AZs) and a fenced standby rather than by scaling out.
@@ -171,6 +172,73 @@ One pair can't be split across partitions without breaking ordering, so its ceil
 4. Shed load early: per-account limits, reject on queue depth, a cancel lane, volatility circuit breakers.
 5. Keep the ledger as a batched projection of the fill stream and accept that it lags matching slightly.
 
+## Reliability: SLIs, SLOs and AI-assisted diagnosis
+
+The latency and availability targets become SLOs with error budgets. The architecture and automation are what keep them: the fenced standby engine, `acks=all` across 3 AZs, admission control and Multi-AZ failover all act in seconds without a human. When something still burns budget, an alert pages on-call and also starts an **AWS DevOps Agent** investigation. The engineer then starts from a root cause with evidence instead of from a wall of dashboards.
+
+### SLIs and SLOs
+
+Every SLI is *good events / valid events*, over a rolling 28-day window. The data comes from OpenTelemetry metrics in Amazon Managed Prometheus. Requests rejected for bad input (4xx) aren't valid events. Our own load shedding (`503`) is, so it spends budget.
+
+| User journey | SLI: good event | Measured at | SLO | Budget (28 days) |
+| --- | --- | --- | --- | --- |
+| Place an order: latency | A valid `POST /orders` acknowledged within 100 ms | Order API server histogram, cross-checked with ALB `TargetResponseTime` | 99% | 1% of orders may be slower. This is the brief's p99 < 100 ms. |
+| Place an order: availability | A valid `POST /orders` that doesn't return 5xx or time out | ALB and Order API | 99.95% | ~20 min of full outage |
+| Get matched | An accepted order whose fill or rejection is published within 250 ms of the ack | Matching engine, per pair (ack → publish) | 99.9% | 0.1% of orders |
+| Market data | A depth update reaching subscribed WebSocket clients within 500 ms of the engine event | WebSocket gateway | 99.9% | 0.1% of updates |
+| Balances | A minute in which ledger projection lag stays under 5 s | Ledger projector consumer lag | 99.9% | ~40 min of stale balances |
+| Durability | An acknowledged order that appears in the engine's output | Daily reconciliation of acknowledged order IDs against consumed offsets | **100%** | None. This is an invariant, not an SLO: any miss is a SEV1. |
+
+### Alerting on error-budget burn
+
+These are multi-window, multi-burn-rate alerts (AMP recording rules, Grafana alerting). An alert fires only when both the long and the short window are over the rate. The long window filters noise, and the short window lets the alert clear soon after recovery.
+
+| Severity | Burn rate | Windows | Budget used if it continues | Goes to |
+| --- | --- | --- | --- | --- |
+| Page | 14.4× | 1 h and 5 min | 2% in 1 hour | On-call (PagerDuty), plus a DevOps Agent investigation |
+| Page | 6× | 6 h and 30 min | 5% in 6 hours | On-call, plus a DevOps Agent investigation |
+| Ticket | 1× | 3 days and 6 h | 10% in 3 days | Owning team's queue |
+
+Cause alarms in CloudWatch also start investigations: under-replicated partitions, engine lag per pair, Aurora failover and Redis evictions. They page only when an SLO is burning.
+
+**Error-budget policy.** When a service has spent its 28-day budget, its releases are frozen except for reliability fixes. A deploy gate in the CI/CD pipeline reads the remaining budget from AMP. Every page gets a blameless postmortem, and a recurring cause goes to the top of the backlog.
+
+### AWS DevOps Agent: diagnosis on every page
+
+AWS DevOps Agent is an AI agent for operations. It builds a topology of the application from the accounts in its *Agent Space*. It then correlates metrics, logs, traces, deployments and code changes to find a root cause, and posts its findings with the evidence it used.
+
+1. A burn-rate alert fires in Grafana, or a cause alarm fires in CloudWatch. The Grafana alert reaches the agent through its webhook contact point. Pages go to on-call through PagerDuty in parallel, and nothing waits for the agent.
+2. The agent investigates. It breaks p99 down hop by hop from X-Ray traces using the latency budget above. It checks consumer lag per pair, MSK, Aurora and Redis health, EKS events, CloudTrail changes, and the deploys and commits behind them in GitHub.
+3. Within minutes, the findings land in the incident Slack channel. Each one is labelled as *root cause*, *contributing cause* or *hypothesis*, with links to the evidence.
+4. On-call checks the evidence and runs the runbook. The agent is **read-only** on AWS resources, and any mitigation it proposes needs explicit human approval.
+
+**Agent Space setup**
+
+| Setting | Value |
+| --- | --- |
+| Accounts | The prod account, both the primary and the standby region. The custody account is deliberately excluded (Problem 5, S18). |
+| Access | A read-only IAM role for CloudWatch, AMP queries, X-Ray, CloudTrail and EKS read access. No access to message contents (MSK), ledger rows (Aurora) or secrets. |
+| Telemetry | CloudWatch (including Container Insights), Grafana for the AMP metrics, X-Ray |
+| Code and deploys | GitHub repos and workflow runs. ArgoCD syncs are recorded as GitHub deployments, so the agent can link a change to its commit. |
+| Incident tools | PagerDuty and Slack |
+
+**Exchange knowledge the agent needs.** Without this context it would guess the way a generic engineer would, and on an exchange that guess is often wrong.
+
+- **Instructions** (apply to every investigation):
+  - On the order path, time priority is the Kafka offset, not a clock.
+  - A pause on one pair right after a Lease change is a planned failover. Check the fencing epoch before calling it an outage.
+  - Never propose restarting an engine leader, deleting a consumer group or skipping offsets. Propose the runbook instead.
+  - Check per-pair lag, under-replicated partitions and the last deploy before anything else.
+- **Skills**: one per row of the [HA table](#high-availability-and-disaster-recovery) (engine failover, broker loss, AZ loss, Aurora failover, region failover). Another breaks a p99 regression down against the latency budget.
+
+**Prevention.** The agent runs a prevention evaluation every week across past investigations. It recommends observability, test, code and infrastructure changes, such as a missing alarm, a missing load test for a hot pair, or an HPA limit hit in the last surge. These recommendations are reviewed at the weekly SLO review next to the budget report.
+
+**What it does and doesn't guarantee.** No tool guarantees an SLO. The design does: everything that has to happen in seconds is automated and deterministic, and the agent is never on the order path. What the agent changes is the human part, the time to diagnose. That matters with a small budget. For example, at 99.95% the month's budget is about 20 minutes. One incident that takes 30 minutes to diagnose spends all of it, while one diagnosed in 5 minutes doesn't. The agent can also be wrong, so its accuracy is measured rather than assumed:
+
+- **Each postmortem** records whether the agent's root cause was correct. Below about 80%, we fix its knowledge or the telemetry gaps it reports.
+- **Each game day** checks that it names the injected fault.
+- **Quota and cost:** investigations are metered, so only pages and cause alarms start one. Dashboards and tickets don't.
+
 ## Security, operations and cost
 
 **Security**
@@ -184,8 +252,8 @@ One pair can't be split across partitions without breaking ordering, so its ceil
 
 - Terraform for infrastructure, ArgoCD for GitOps deployment to EKS.
 - OpenTelemetry traces and metrics into Amazon Managed Prometheus, Grafana and X-Ray.
-- Alerts: SLO burn rate on order-placement p99, matching-engine consumer lag per pair, Kafka under-replicated partitions, ledger projection lag.
-- Game days: kill an engine leader, a broker and an AZ, and confirm replay produces identical output hashes.
+- Alerts: SLO burn rates, plus cause alarms (matching-engine consumer lag per pair, Kafka under-replicated partitions, ledger projection lag). Each one starts an AWS DevOps Agent investigation. See [Reliability](#reliability-slis-slos-and-ai-assisted-diagnosis).
+- Game days: kill an engine leader, a broker and an AZ, and confirm replay produces identical output hashes. Also check that DevOps Agent names the injected fault as the root cause.
 
 **Cost**
 
@@ -199,7 +267,7 @@ All diagrams are in [`diagrams/castle-in-the-cloud.drawio`](diagrams/castle-in-t
 
 | Page | Type | Shows |
 | --- | --- | --- |
-| 1. AWS architecture | Component / deployment | Region, VPC, subnets, EKS services, managed data services, warm standby region, numbered order path ①–⑨ |
+| 1. AWS architecture | Component / deployment | Region, VPC, subnets, EKS services, managed data services, SLO alerting into AWS DevOps Agent, warm standby region, numbered order path ①–⑨ |
 | 2. Sequence — place order | UML sequence | Trader → edge → Order API → Redis hold → MSK produce → `202 Accepted`, then a `par` fragment for async matching, fill push and ledger settlement |
 | 3. Sequence — engine failover + fencing | UML sequence | Leader stall, Lease takeover, `initTransactions` epoch bump, old leader fenced with `ProducerFencedException` |
 
