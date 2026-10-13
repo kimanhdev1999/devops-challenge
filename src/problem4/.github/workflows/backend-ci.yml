@@ -27,7 +27,7 @@ defaults:
 jobs:
   test:
     name: Lint, test, audit
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-ci-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -50,7 +50,7 @@ jobs:
     name: Build and scan image
     needs: test
     if: ${{ github.event_name == 'pull_request' || inputs.build-image }}
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-ci-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 15
     permissions:
       contents: read

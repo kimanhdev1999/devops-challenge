@@ -5,10 +5,11 @@ Two GitHub Actions pipelines that take a commit on `main` to production without 
 - **Backend** (HTTP API on EC2): build one container image, push it to ECR, roll it across staging, then production, one instance at a time. Each instance is drained from the load balancer and health-checked, with automatic rollback.
 - **Frontend** (static SPA on S3): build one bundle and publish the same bundle to staging, then production. Assets go up before `index.html`, then CloudFront is invalidated, with automatic rollback.
 
-Production needs a human approval. AWS access uses short-lived OIDC credentials, never stored keys.
+Production needs a human approval. AWS access uses short-lived OIDC credentials, never stored keys. Every job runs on an ephemeral **AWS CodeBuild-hosted runner** in our own AWS account, not on GitHub's machines.
 
 ```
 src/problem4/
+├── .github/actionlint.yaml      registers the CodeBuild runner labels for actionlint
 ├── .github/workflows/
 │   ├── backend-ci.yml          PR gate: lint, test, npm audit, image build + Trivy
 │   ├── backend-deploy.yml      main: gate → build/scan/push once → staging → production
@@ -23,6 +24,7 @@ src/problem4/
 ├── frontend/                   sample SPA with a content-hashing build, tests
 ├── scripts/                    CI-side deploy, publish and smoke-test scripts
 └── deploy/
+    ├── codebuild/              Terraform for the two CodeBuild runner projects (gha-ci, gha-release)
     ├── ec2/                    on-instance deploy.sh, SSM document, launch-template user data
     └── iam/                    OIDC trust policy + least-privilege policies for every role
 ```
@@ -40,6 +42,7 @@ src/problem4/
 | Human gate where it matters | The `production` GitHub Environment has required reviewers and a main-only branch rule. Staging deploys automatically. |
 | No standing credentials | GitHub OIDC → `AssumeRoleWithWebIdentity`. Each role trusts exactly one repo + environment and can touch only its own bucket, distribution, SSM document or tagged instances. |
 | Supply-chain hygiene | Every third-party action is pinned to a full commit SHA. Workflows default to `permissions: {}` and each job asks for the minimum. Images carry SBOM and provenance. Shell never interpolates `${{ inputs }}` directly. |
+| Builds run on infrastructure we control | Jobs run on ephemeral AWS CodeBuild runners: one fresh container per job, destroyed afterwards. PR code and release jobs use separate runner projects with separate caches. Release runners sit in private subnets with a fixed egress IP. |
 | Predictable operations | Concurrency groups serialise releases per app and never cancel a half-finished rollout. Every job has a timeout. npm and Docker layers are cached. A step summary records what went where. |
 
 ## Pipelines
@@ -108,6 +111,31 @@ The SSM document only accepts an ECR image *pinned by digest* and a target-group
 | Backend | Per instance, `deploy.sh` restores the previous container. Per environment, the job re-rolls the previous digest. | `backend-rollback` (`workflow_dispatch`): pick the environment and a full SHA. It resolves the digest in ECR and runs the same rolling deploy. Production still needs approval. |
 | Frontend | The job republishes the previously live release. | `frontend-rollback`: republishes `releases/<sha>`. The old hashed assets are still in the bucket, so this is effectively an `index.html` swap. |
 
+### Build runners: AWS CodeBuild
+
+Every job runs on a **CodeBuild-hosted GitHub Actions runner**, not on a GitHub-hosted VM. A job asks for one with a label:
+
+```yaml
+runs-on: codebuild-gha-release-${{ github.run_id }}-${{ github.run_attempt }}
+```
+
+When the job is queued, GitHub sends a `WORKFLOW_JOB_QUEUED` webhook to the CodeBuild project named in the label (`gha-release`). CodeBuild starts a fresh container that registers as a runner for that one job, runs it, and is destroyed. Nothing carries over between jobs, and there is no runner fleet to patch or scale. The run ID and attempt in the label tie each container to its own run.
+
+There are two runner projects (`deploy/codebuild/runners.tf`), split by how much the job is trusted:
+
+| Project | Used by | Network | Why separate |
+| --- | --- | --- | --- |
+| `gha-ci` | `backend-ci`, `frontend-ci`, `security`, `frontend-rollback` input check | CodeBuild default (no VPC) | Runs code from any PR, so it gets no AWS permissions and nothing to reach. |
+| `gha-release` | `backend-deploy` image build, `backend-rollback` lookup, `_deploy-backend`, `_deploy-frontend` | Private subnets in the CI account; egress through NAT (fixed IP) and Network Firewall | These jobs push images and deploy. A separate project means a separate Docker layer cache, so layers built from a PR can never end up in a release image. The fixed egress IP lets ECR, S3 and the ALB-facing smoke tests be locked to known sources. |
+
+**Credentials don't change.** Each CodeBuild service role can only write its own logs, use the GitHub connection and, for `gha-release`, attach network interfaces in the release subnets. Pushing to ECR and deploying still go through `aws-actions/configure-aws-credentials` and the per-environment OIDC roles in `deploy/iam/`, so the trust policies, approvals and environment pinning work exactly as before. A runner on its own can't deploy anything.
+
+**Compared with GitHub-hosted runners:**
+
+- **Gained:** builds run in our account and network, with logs in CloudWatch and every API call in CloudTrail. There's a fixed egress IP. Compute size is chosen per project. Billing is per build minute on the AWS bill.
+- **Cost:** a cold start of roughly 30–60 s per job while CodeBuild provisions the container (less with reserved capacity fleets). We also own the build image choice (`aws/codebuild/standard:7.0`, Ubuntu with Docker, jq and AWS CLI) and must keep it current. Jobs need `privileged_mode` for the Docker daemon (Buildx and the gitleaks container). That is acceptable because each container is single-use.
+- **Limit to know:** CodeBuild's webhook can't restrict which branch may use `gha-release`, so a PR could edit a workflow to request it. That is safe because the release runner has no deploy rights of its own: those come only from OIDC roles pinned to the `staging` / `production` GitHub Environments, and `production` only accepts `main`.
+
 ### Security workflow
 
 `security.yml` runs gitleaks over the full git history on every PR and every push to `main`. It uses the CLI image, because `gitleaks-action` needs a paid licence for organisation repos. On PRs it also runs dependency review (fail on HIGH). A weekly schedule re-scans unchanged code against newly disclosed issues.
@@ -121,6 +149,7 @@ The SSM document only accepts an ECR image *pinned by digest* and a target-group
 | Two environments, `staging` and `production`, ideally in separate AWS accounts | That's the minimum for a pre-production check. Separate accounts limit the blast radius. Roles and variables are per GitHub Environment, so this works either way. |
 | ECR lives in a shared tooling account; staging and production pull cross-account | Build once, promote the same digest everywhere. |
 | AWS infrastructure (ASG, ALB, buckets, CloudFront with OAC, SSM document, IAM roles, OIDC provider) is provisioned separately with Terraform | Pipelines deploy *applications*. Letting them change infrastructure would widen what the deploy roles can do. `deploy/` contains what Terraform would create. |
+| CI runs on AWS CodeBuild-hosted runners in the shared services / CI account, with a GitHub App connection (AWS CodeConnections) to the repo | Keeps builds on infrastructure we control and audit, with a fixed egress IP, without running a self-managed runner fleet. |
 | Trunk-based development: PRs into `main`, and `main` is always releasable | The simplest model that supports continuous delivery with an approval gate. |
 | Node 22 LTS for both apps | Current LTS. The brief didn't name a stack, so the sample apps are deliberately tiny. |
 
@@ -131,13 +160,15 @@ The SSM document only accepts an ECR image *pinned by digest* and a target-group
 - **Variables in each environment:** `AWS_DEPLOY_ROLE_ARN`, `BACKEND_URL`, `BACKEND_TARGET_GROUP_ARN`, optionally `BACKEND_SSM_DOCUMENT`; and `AWS_FRONTEND_ROLE_ARN`, `SITE_URL`, `SITE_BUCKET`, `RELEASES_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`, `API_BASE_URL`.
 - **No secrets.** Everything above is a non-secret identifier.
 - **Branch protection on `main`:** require `backend-ci`, `frontend-ci` and `security` to pass.
+- **CodeBuild runners** (CI account): create an AWS CodeConnections GitHub connection and approve it in the console, then `terraform apply` `deploy/codebuild/runners.tf` with the repo URL, connection ARN and the release VPC and subnets. This creates both runner projects and their webhooks.
 - **AWS:** create the IAM roles from `deploy/iam/` (each trust policy pinned to `repo:<owner>/<repo>:environment:<env>`). The instance role also needs the `AmazonSSMManagedInstanceCore` managed policy. Make ECR tags immutable and turn on scan-on-push. The site bucket is private behind CloudFront OAC, with versioning on.
 
 ## How this was verified (no AWS account available)
 
 | Check | Result |
 | --- | --- |
-| `actionlint` 1.7.12 (includes shellcheck on every `run:` block) on all 9 workflows | 0 findings |
+| `actionlint` 1.7.12 (includes shellcheck on every `run:` block) on all 9 workflows, with the CodeBuild labels registered in `.github/actionlint.yaml` | 0 findings |
+| `terraform validate` (Terraform 1.14, AWS provider 6.x) on `deploy/codebuild/runners.tf` | valid |
 | `shellcheck` on all scripts in `scripts/` and `deploy/ec2/` | 0 findings |
 | Every pinned action's `action.yml` fetched at its SHA; inputs and outputs used were checked against it | all valid |
 | Backend: ESLint, `node --test` (3 tests), `npm audit` | pass, 0 vulnerabilities |
@@ -147,7 +178,7 @@ The SSM document only accepts an ECR image *pinned by digest* and a target-group
 | `smoke-test-frontend.sh` against the built bundle served locally | pass |
 | IAM policy JSON | valid JSON. Not validated by IAM Access Analyzer (needs an account). |
 
-**Not exercised:** anything that talks to AWS (OIDC role assumption, ECR push, SSM Run Command, ALB drain and register, S3 and CloudFront) and the GitHub-hosted parts (Environments, approvals, artifact passing between reusable workflows). These are written against the documented CLI and API behaviour and are the first thing to test in a sandbox account.
+**Not exercised:** anything that talks to AWS (CodeBuild runner registration and webhooks, OIDC role assumption, ECR push, SSM Run Command, ALB drain and register, S3 and CloudFront) and the GitHub-hosted parts (Environments, approvals, artifact passing between reusable workflows). These are written against the documented CLI and API behaviour and are the first thing to test in a sandbox account.
 
 ## Deliberately left out
 
