@@ -96,6 +96,24 @@ Grouped by layer, following the request path from the internet inward.
 | --- | --- | --- |
 | **S13** [ADDED] | **Isolated custody account** with a **withdrawal policy engine** that consumes withdrawal requests over **PrivateLink**. It is the only path to signing. Rules: per-user and global velocity limits; address allowlist with a 24-hour activation delay for new addresses; sanctions and chain-analytics screening; a 24-hour lock after password, MFA or API-key changes; **dual human approval above a threshold**. **Signing keys live in CloudHSM or an MPC signer** and are never exported. **Hot / warm / cold split:** the hot wallet holds only a few hours of withdrawal volume; most funds sit in multi-sig cold storage offline. | **The main loss scenario.** Even full compromise of the prod account can't sign a transaction outside policy, and the hot float caps the worst case. |
 
+#### Hot, warm and cold wallets
+
+A crypto wallet is just a set of private keys: whoever can sign with the key can move the coins, and an on-chain transfer can't be reversed. Any key that is online and signs automatically can be abused by an attacker who gets far enough in. Any key that is offline is safe but slow to use. No single wallet can be both fast and safe, so funds are split into three tiers. The bottom row of the custody account in the diagram shows them:
+
+| Tier | In the diagram | Holds | How it signs | Why it exists |
+| --- | --- | --- | --- | --- |
+| **Hot** | Red box, signed by **CloudHSM / MPC** | A few hours of expected withdrawals | Online and automatic, after the policy engine (and dual approval above the threshold) | Lets normal withdrawals go out in seconds. Because it holds so little, it caps what an attacker can steal if every other control fails. |
+| **Warm** | Orange box | Roughly 1–2 days of withdrawals | Multi-sig, with keys held by separate custody staff; signs on request in minutes to hours | A buffer that refills the hot wallet without touching cold storage every day. Stealing from it needs several people or keys at once. |
+| **Cold** | Blue box with a **dashed border** (offline: no network, so nothing on AWS to draw) | The bulk of customer funds (typically 90%+) | Offline multi-sig on air-gapped hardware, keys split across people and locations; a scheduled ceremony takes hours | Keeps most funds out of reach of any network attack, including a full AWS compromise. |
+
+Funds move between the tiers along the arrows:
+
+- **Top-up:** when the hot wallet falls below its floor, the warm wallet refills it. When the warm wallet runs low, a cold-storage ceremony refills it. Both are planned from withdrawal forecasts so that customers never wait on cold storage.
+- **Sweep:** customer deposits and any hot or warm balance above its ceiling are moved back to cold storage on a schedule, so the online float stays small.
+- **Alerts:** hot and warm balances are monitored against their floor and ceiling. An unexpected drop pages on-call and halts withdrawals, the same as a reconciler mismatch (S11).
+
+The trade-off is speed for the rare large withdrawal: if it exceeds the hot float, it waits for a warm top-up, which adds minutes to hours. This is the same trade-off as dual approval, and it only affects a small share of withdrawals by count.
+
 ### Detection, response and audit
 
 | ID | Change | What it protects against |
