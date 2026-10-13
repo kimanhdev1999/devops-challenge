@@ -18,7 +18,7 @@ permissions: {}
 jobs:
   resolve:
     name: Resolve image for ${{ inputs.version }}
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-release-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 5
     permissions:
       contents: read

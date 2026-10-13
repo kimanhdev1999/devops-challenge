@@ -22,7 +22,7 @@ permissions: {}
 jobs:
   deploy:
     name: Deploy frontend to ${{ inputs.environment }}
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-release-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 20
     environment:
       name: ${{ inputs.environment }}

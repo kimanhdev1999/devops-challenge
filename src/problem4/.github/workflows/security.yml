@@ -16,7 +16,7 @@ concurrency:
 jobs:
   secrets:
     name: Secret scan (gitleaks)
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-ci-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -34,7 +34,7 @@ jobs:
   dependencies:
     name: Dependency review
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-ci-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 5
     permissions:
       contents: read

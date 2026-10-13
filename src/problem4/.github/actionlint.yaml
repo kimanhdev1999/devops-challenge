@@ -1,0 +1,5 @@
+# CodeBuild-hosted runners are selected by a per-run label; see deploy/codebuild/runners.tf.
+self-hosted-runner:
+  labels:
+    - codebuild-gha-ci-*
+    - codebuild-gha-release-*

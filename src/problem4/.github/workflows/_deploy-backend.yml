@@ -22,7 +22,7 @@ permissions: {}
 jobs:
   deploy:
     name: Deploy backend to ${{ inputs.environment }}
-    runs-on: ubuntu-24.04
+    runs-on: codebuild-gha-release-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 45
     # Production has required reviewers and a main-only branch rule in repo settings.
     environment:
