@@ -1,11 +1,18 @@
 # syntax=docker/dockerfile:1.7
 # In production pin the base image by digest (node:22-alpine@sha256:...) and let Dependabot bump it.
-FROM node:22-alpine AS deps
+# CI pulls the same image through the ECR pull-through cache by setting
+# BASE_REGISTRY=<registry>/ecr-public/docker/library (a mirror of Docker Official Images).
+ARG BASE_REGISTRY=docker.io/library
+
+FROM ${BASE_REGISTRY}/node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts
+# CI mounts an npmrc pointing at CodeArtifact. It is a build secret, so the token never lands in
+# a layer. Without it (local builds) npm uses the public registry.
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm ci --omit=dev --ignore-scripts
 
-FROM node:22-alpine
+FROM ${BASE_REGISTRY}/node:22-alpine
 # The runtime needs node, not a package manager. Removing npm/yarn/corepack drops most of the
 # image's CVE surface (Trivy flags their bundled dependencies) and tools an attacker could use.
 RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \

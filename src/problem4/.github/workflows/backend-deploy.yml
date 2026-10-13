@@ -27,6 +27,7 @@ jobs:
       build-image: false
     permissions:
       contents: read
+      id-token: write
 
   build:
     name: Build, scan and push image
@@ -42,6 +43,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Use the dependency cache (CodeArtifact)
+        id: deps
+        uses: ./.github/actions/dependency-cache
+        with:
+          role-arn: ${{ vars.AWS_DEPS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          domain: ${{ vars.CODEARTIFACT_DOMAIN }}
+          domain-owner: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+          repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
+      # Push role from here on. The base image comes through the ECR pull-through cache in
+      # the same registry, which the push role can also read (deploy/iam/ecr-push-policy.json).
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
@@ -58,7 +70,10 @@ jobs:
           push: true
           # Tag = commit SHA; the ECR repo has immutable tags, so a tag can never be repointed.
           tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
-          build-args: APP_VERSION=${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            BASE_REGISTRY=${{ steps.ecr.outputs.registry }}/ecr-public/docker/library
+          secret-files: npmrc=${{ steps.deps.outputs.npmrc }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=backend
@@ -93,6 +108,19 @@ jobs:
       environment: production
       image: ${{ needs.build.outputs.image }}
       version: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Any failure (gate, build, staging, production) → AWS DevOps Agent investigates it.
+  investigate:
+    needs: [ci, build, staging, production]
+    if: failure()
+    uses: ./.github/workflows/_investigate-failure.yml
+    with:
+      app: backend
+      priority: ${{ needs.production.result == 'failure' && 'HIGH' || needs.staging.result == 'failure' && 'MEDIUM' || 'LOW' }}
+      results: ${{ toJSON(needs) }}
     permissions:
       contents: read
       id-token: write

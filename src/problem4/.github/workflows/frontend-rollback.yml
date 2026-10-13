@@ -37,3 +37,16 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+  # A failed rollback → AWS DevOps Agent investigates it.
+  investigate:
+    needs: [validate, deploy]
+    if: failure()
+    uses: ./.github/workflows/_investigate-failure.yml
+    with:
+      app: frontend
+      priority: ${{ inputs.environment == 'production' && 'CRITICAL' || 'MEDIUM' }}
+      results: ${{ toJSON(needs) }}
+    permissions:
+      contents: read
+      id-token: write

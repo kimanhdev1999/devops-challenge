@@ -5,11 +5,13 @@ Two GitHub Actions pipelines that take a commit on `main` to production without 
 - **Backend** (HTTP API on EC2): build one container image, push it to ECR, roll it across staging, then production, one instance at a time. Each instance is drained from the load balancer and health-checked, with automatic rollback.
 - **Frontend** (static SPA on S3): build one bundle and publish the same bundle to staging, then production. Assets go up before `index.html`, then CloudFront is invalidated, with automatic rollback.
 
-Production needs a human approval. AWS access uses short-lived OIDC credentials, never stored keys. Every job runs on an ephemeral **AWS CodeBuild-hosted runner** in our own AWS account, not on GitHub's machines.
+Production needs a human approval. AWS access uses short-lived OIDC credentials, never stored keys. Every job runs on an ephemeral **AWS CodeBuild-hosted runner** in our own AWS account, not on GitHub's machines. npm packages and base images come from a **dependency cache** in that account (CodeArtifact and an ECR pull-through cache), not straight from the public registries. When a release or rollback fails, **AWS DevOps Agent** is asked to investigate it.
 
 ```
 src/problem4/
 ├── .github/actionlint.yaml      registers the CodeBuild runner labels for actionlint
+├── .github/actions/
+│   └── dependency-cache/       composite: npm → CodeArtifact, Docker → ECR pull-through cache
 ├── .github/workflows/
 │   ├── backend-ci.yml          PR gate: lint, test, npm audit, image build + Trivy
 │   ├── backend-deploy.yml      main: gate → build/scan/push once → staging → production
@@ -19,12 +21,14 @@ src/problem4/
 │   ├── frontend-deploy.yml     main: gate/build once → staging → production
 │   ├── frontend-rollback.yml   manual: republish any archived release
 │   ├── _deploy-frontend.yml    reusable: two-phase publish + smoke test + auto-rollback
+│   ├── _investigate-failure.yml reusable: hand a failed release to AWS DevOps Agent
 │   └── security.yml            gitleaks (history), dependency review, weekly re-scan
 ├── backend/                    sample Express API (/healthz reports the deployed SHA), tests, Dockerfile
 ├── frontend/                   sample SPA with a content-hashing build, tests
 ├── scripts/                    CI-side deploy, publish and smoke-test scripts
 └── deploy/
-    ├── codebuild/              Terraform for the two CodeBuild runner projects (gha-ci, gha-release)
+    ├── codebuild/              Terraform: the two CodeBuild runner projects (gha-ci, gha-release)
+    │                           and the dependency cache (CodeArtifact, ECR pull-through, VPC endpoints)
     ├── ec2/                    on-instance deploy.sh, SSM document, launch-template user data
     └── iam/                    OIDC trust policy + least-privilege policies for every role
 ```
@@ -44,6 +48,8 @@ src/problem4/
 | Supply-chain hygiene | Every third-party action is pinned to a full commit SHA. Workflows default to `permissions: {}` and each job asks for the minimum. Images carry SBOM and provenance. Shell never interpolates `${{ inputs }}` directly. |
 | Builds run on infrastructure we control | Jobs run on ephemeral AWS CodeBuild runners: one fresh container per job, destroyed afterwards. PR code and release jobs use separate runner projects with separate caches. Release runners sit in private subnets with a fixed egress IP. |
 | Predictable operations | Concurrency groups serialise releases per app and never cancel a half-finished rollout. Every job has a timeout. npm and Docker layers are cached. A step summary records what went where. |
+| Fast, reliable dependency downloads | npm packages come from a CodeArtifact repository and base images from an ECR pull-through cache, both in our account. A public registry outage or Docker Hub rate limit doesn't stop a build, and release runners fetch dependencies through VPC endpoints instead of NAT. |
+| Failures get diagnosed, not just reported | A failed release or rollback starts an AWS DevOps Agent investigation. It reads the run's logs, the deployment and the AWS telemetry, and posts a root-cause analysis for the on-call engineer. |
 
 ## Pipelines
 
@@ -54,12 +60,14 @@ flowchart LR
     bm[push main] --> bgate[same gate] --> bbuild[build once → ECR<br/>scan pushed digest]
     bbuild --> bstg[staging<br/>rolling deploy · smoke]
     bstg --> bappr{{approval}} --> bprod[production<br/>rolling deploy · smoke]
+    bbuild & bstg & bprod -. failure .-> bagent[AWS DevOps Agent<br/>investigation]
   end
   subgraph Frontend
     fpr[PR] --> fci[lint · test · audit · build]
     fm[push main] --> fbuild[gate + build once<br/>artifact frontend-dist-SHA]
     fbuild --> fstg[staging<br/>archive · publish · smoke]
     fstg --> fappr{{approval}} --> fprod[production<br/>publish · smoke]
+    fbuild & fstg & fprod -. failure .-> fagent[AWS DevOps Agent<br/>investigation]
   end
 ```
 
@@ -126,7 +134,7 @@ There are two runner projects (`deploy/codebuild/runners.tf`), split by how much
 | Project | Used by | Network | Why separate |
 | --- | --- | --- | --- |
 | `gha-ci` | `backend-ci`, `frontend-ci`, `security`, `frontend-rollback` input check | CodeBuild default (no VPC) | Runs code from any PR, so it gets no AWS permissions and nothing to reach. |
-| `gha-release` | `backend-deploy` image build, `backend-rollback` lookup, `_deploy-backend`, `_deploy-frontend` | Private subnets in the CI account; egress through NAT (fixed IP) and Network Firewall | These jobs push images and deploy. A separate project means a separate Docker layer cache, so layers built from a PR can never end up in a release image. The fixed egress IP lets ECR, S3 and the ALB-facing smoke tests be locked to known sources. |
+| `gha-release` | `backend-deploy` image build, `backend-rollback` lookup, `_deploy-backend`, `_deploy-frontend`, `_investigate-failure` | Private subnets in the CI account; egress through NAT (fixed IP) and Network Firewall | These jobs push images and deploy. A separate project means a separate Docker layer cache, so layers built from a PR can never end up in a release image. The fixed egress IP lets ECR, S3 and the ALB-facing smoke tests be locked to known sources. |
 
 **Credentials don't change.** Each CodeBuild service role can only write its own logs, use the GitHub connection and, for `gha-release`, attach network interfaces in the release subnets. Pushing to ECR and deploying still go through `aws-actions/configure-aws-credentials` and the per-environment OIDC roles in `deploy/iam/`, so the trust policies, approvals and environment pinning work exactly as before. A runner on its own can't deploy anything.
 
@@ -135,6 +143,54 @@ There are two runner projects (`deploy/codebuild/runners.tf`), split by how much
 - **Gained:** builds run in our account and network, with logs in CloudWatch and every API call in CloudTrail. There's a fixed egress IP. Compute size is chosen per project. Billing is per build minute on the AWS bill.
 - **Cost:** a cold start of roughly 30–60 s per job while CodeBuild provisions the container (less with reserved capacity fleets). We also own the build image choice (`aws/codebuild/standard:7.0`, Ubuntu with Docker, jq and AWS CLI) and must keep it current. Jobs need `privileged_mode` for the Docker daemon (Buildx and the gitleaks container). That is acceptable because each container is single-use.
 - **Limit to know:** CodeBuild's webhook can't restrict which branch may use `gha-release`, so a PR could edit a workflow to request it. That is safe because the release runner has no deploy rights of its own: those come only from OIDC roles pinned to the `staging` / `production` GitHub Environments, and `production` only accepts `main`.
+
+### Dependency cache: CodeArtifact and ECR pull-through
+
+Every `npm ci` and every base image pull goes through a cache in the CI account (`deploy/codebuild/dependency-cache.tf`) instead of straight to npmjs or Docker Hub.
+
+| What | Cache | How jobs use it |
+| --- | --- | --- |
+| npm packages | CodeArtifact domain `ci`, repository `npm`, with an upstream connection to `public:npmjs`. The first request for a version fetches and keeps it. Later builds read it from CodeArtifact. | The `dependency-cache` composite action gets a 1-hour token and writes an npmrc to `$RUNNER_TEMP`, then points `NPM_CONFIG_USERCONFIG` at it. `package-lock.json` keeps its `registry.npmjs.org` URLs, and npm rewrites them to the configured registry (`replace-registry-host` defaults to `npmjs`). The `integrity` hashes still apply. |
+| npm inside `docker build` | Same repository | The npmrc is passed as a BuildKit secret (`secret-files: npmrc=…`) and mounted only for `RUN npm ci`. It never lands in a layer, and since secrets aren't part of the cache key, a new token doesn't invalidate the layer cache. Local builds without the secret use the public registry. |
+| Base image `node:22-alpine` | ECR pull-through cache rule `ecr-public` → `public.ecr.aws`, which mirrors Docker Official Images. No upstream credentials and no Docker Hub pull limits. | CI sets `BASE_REGISTRY=<registry>/ecr-public/docker/library`. The Dockerfile defaults to `docker.io/library`, so local builds are unchanged. |
+
+**Access.** A read-only OIDC role, `gha-deps-read`, can fetch packages and pull or import base images, and nothing else. It trusts every workflow in the repo, PRs included. That is safe because all it can do is read public packages. The ECR push role can also pull through the cache, because the release build logs Docker in with that role.
+
+**Network.** The PR runners have no VPC, so they use the public AWS endpoints. Release runners reach CodeArtifact (`codeartifact.api`, and `codeartifact.repositories` with private DNS) and ECR (`ecr.api`, `ecr.dkr`) through interface endpoints, and S3 through a gateway endpoint. Package and layer bytes therefore never cross the NAT gateway, so they add no NAT data charges and leave nothing for Network Firewall to inspect.
+
+**Caching layers, fastest first:** the `setup-node` npm cache, a hit in CodeArtifact or ECR, and only then the public registry. Docker layers keep the existing Buildx (`gha`) and CodeBuild local caches.
+
+**Why CodeArtifact rather than JFrog Artifactory or Nexus:** it's managed, billed per GB, and uses the same IAM and OIDC as everything else here. Artifactory is the better choice if the organisation already runs it, or needs one proxy for many ecosystems with advanced curation. The workflow change would be the same: a different registry URL and token in the npmrc.
+
+### AI incident investigation: AWS DevOps Agent
+
+[AWS DevOps Agent](https://aws.amazon.com/devops-agent/) is an AI agent that investigates operational incidents. It correlates logs, metrics, deployments, code changes and CloudTrail across the accounts in its *Agent Space*, then posts a root-cause analysis and mitigation steps. Here it is the last step of every release and rollback workflow, and it only runs when something failed:
+
+```yaml
+investigate:
+  needs: [ci, build, staging, production]
+  if: failure()
+  uses: ./.github/workflows/_investigate-failure.yml
+```
+
+`_investigate-failure.yml` assumes `gha-devops-agent-notify`, a role that can read one Secrets Manager secret and trusts only runs on `main`. It reads the Agent Space's generic webhook URL and HMAC signing secret from that secret. `scripts/notify-devops-agent.sh` then posts a signed incident (`x-amzn-event-signature`, base64 HMAC-SHA256 of `<timestamp>:<body>`). The agent only sees `title`, `description` and `priority`, so the description carries the run URL, commit, failed jobs, image digest and where to look: SSM Run Command output and ALB target health for the backend, and the S3/CloudFront publish for the frontend.
+
+| Failure | Priority |
+| --- | --- |
+| Rollback workflow failed in production (the recovery path itself is broken) | CRITICAL |
+| Release failed in production (auto-rollback has already run) | HIGH |
+| Release failed in staging, or a rollback failed in staging | MEDIUM |
+| Gate or build failed on `main` | LOW |
+
+`incidentId` is `gha-<repo>-<run id>-<attempt>`, so a re-run is a new investigation and a duplicate delivery isn't.
+
+**What the agent can see** is set up once in the Agent Space, not in the pipeline:
+
+- **AWS accounts:** the tooling/CI, staging and production accounts. It reads CloudWatch logs and metrics, CloudTrail, SSM command history and the ALB, S3 and CloudFront resources.
+- **GitHub pipeline integration:** through the AWS DevOps Agent GitHub App, it has read access to the repo, workflow runs and logs, and deployments. This lets it tie a failure to the exact commit and diff.
+- **CloudWatch alarms:** optionally, production alarms (ALB 5xx, unhealthy hosts) can also trigger investigations. Problems that show up *after* a green deploy are then investigated with the release already in context.
+
+**Why it only advises and never gates.** The deterministic steps decide what ships: tests, scans, smoke tests and automatic rollback. The agent runs after those steps have already acted. It speeds up diagnosis, which is where most time to recovery goes, but nothing waits on it and it holds no write access. If you later want it to open fix PRs, AWS's documented approach is to add the GitHub MCP server with a fine-grained token scoped to this repo. Those PRs still go through branch protection and human review.
 
 ### Security workflow
 
@@ -156,19 +212,22 @@ There are two runner projects (`deploy/codebuild/runners.tf`), split by how much
 ### One-time setup the workflows expect
 
 - **GitHub Environments** `staging` and `production`. Give production required reviewers and a deployment branch rule of `main` only.
-- **Repository variables:** `AWS_REGION`, `AWS_ECR_ROLE_ARN`, `ECR_REPOSITORY`.
+- **Repository variables:** `AWS_REGION`, `AWS_ECR_ROLE_ARN`, `ECR_REPOSITORY`; for the dependency cache, `AWS_DEPS_ROLE_ARN`, `CODEARTIFACT_DOMAIN`, `CODEARTIFACT_DOMAIN_OWNER`, `CODEARTIFACT_REPOSITORY` (all Terraform outputs); for DevOps Agent, `AWS_DEVOPS_AGENT_ROLE_ARN` and optionally `DEVOPS_AGENT_WEBHOOK_SECRET_ID`.
 - **Variables in each environment:** `AWS_DEPLOY_ROLE_ARN`, `BACKEND_URL`, `BACKEND_TARGET_GROUP_ARN`, optionally `BACKEND_SSM_DOCUMENT`; and `AWS_FRONTEND_ROLE_ARN`, `SITE_URL`, `SITE_BUCKET`, `RELEASES_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`, `API_BASE_URL`.
-- **No secrets.** Everything above is a non-secret identifier.
+- **No GitHub secrets.** Everything above is a non-secret identifier. The only secret (the DevOps Agent webhook key) lives in AWS Secrets Manager.
 - **Branch protection on `main`:** require `backend-ci`, `frontend-ci` and `security` to pass.
-- **CodeBuild runners** (CI account): create an AWS CodeConnections GitHub connection and approve it in the console, then `terraform apply` `deploy/codebuild/runners.tf` with the repo URL, connection ARN and the release VPC and subnets. This creates both runner projects and their webhooks.
+- **CodeBuild runners** (CI account): create an AWS CodeConnections GitHub connection and approve it in the console, then `terraform apply` `deploy/codebuild/runners.tf` with the repo URL, connection ARN and the release VPC and subnets. This creates both runner projects and their webhooks. The same apply creates the dependency cache. It also needs `github_repo`, the OIDC provider ARN and the release route table IDs.
+- **AWS DevOps Agent:** create an Agent Space with the tooling, staging and production accounts, and connect GitHub as a pipeline source (install the AWS DevOps Agent GitHub App, read-only). Add a generic webhook with HMAC authentication. Store `{"url": "…", "secret": "…"}` as the Secrets Manager secret `devops-agent/github-actions-webhook` in the tooling account. Create `gha-devops-agent-notify` from `deploy/iam/devops-agent-notify-*.json`.
 - **AWS:** create the IAM roles from `deploy/iam/` (each trust policy pinned to `repo:<owner>/<repo>:environment:<env>`). The instance role also needs the `AmazonSSMManagedInstanceCore` managed policy. Make ECR tags immutable and turn on scan-on-push. The site bucket is private behind CloudFront OAC, with versioning on.
 
 ## How this was verified (no AWS account available)
 
 | Check | Result |
 | --- | --- |
-| `actionlint` 1.7.12 (includes shellcheck on every `run:` block) on all 9 workflows, with the CodeBuild labels registered in `.github/actionlint.yaml` | 0 findings |
-| `terraform validate` (Terraform 1.14, AWS provider 6.x) on `deploy/codebuild/runners.tf` | valid |
+| `actionlint` 1.7.12 (includes shellcheck on every `run:` block) on all 10 workflows and the composite action, with the CodeBuild labels registered in `.github/actionlint.yaml` | 0 findings |
+| `terraform validate` (Terraform 1.14, AWS provider 6.x) on `deploy/codebuild/` (runners + dependency cache) | valid |
+| Backend image built with the new Dockerfile, both without the npmrc secret (local default, Docker Hub) and with `BASE_REGISTRY=public.ecr.aws/docker/library` (the pull-through upstream) plus `--secret id=npmrc` | both build; no npmrc in the image history |
+| `notify-devops-agent.sh` against a local server that checks the signature with the algorithm from the AWS DevOps Agent webhook docs | signature valid, payload matches the documented schema |
 | `shellcheck` on all scripts in `scripts/` and `deploy/ec2/` | 0 findings |
 | Every pinned action's `action.yml` fetched at its SHA; inputs and outputs used were checked against it | all valid |
 | Backend: ESLint, `node --test` (3 tests), `npm audit` | pass, 0 vulnerabilities |
@@ -178,7 +237,7 @@ There are two runner projects (`deploy/codebuild/runners.tf`), split by how much
 | `smoke-test-frontend.sh` against the built bundle served locally | pass |
 | IAM policy JSON | valid JSON. Not validated by IAM Access Analyzer (needs an account). |
 
-**Not exercised:** anything that talks to AWS (CodeBuild runner registration and webhooks, OIDC role assumption, ECR push, SSM Run Command, ALB drain and register, S3 and CloudFront) and the GitHub-hosted parts (Environments, approvals, artifact passing between reusable workflows). These are written against the documented CLI and API behaviour and are the first thing to test in a sandbox account.
+**Not exercised:** anything that talks to AWS (CodeBuild runner registration and webhooks, CodeArtifact, the ECR pull-through cache, the real DevOps Agent webhook, OIDC role assumption, ECR push, SSM Run Command, ALB drain and register, S3 and CloudFront) and the GitHub-hosted parts (Environments, approvals, artifact passing between reusable workflows). These are written against the documented CLI and API behaviour and are the first thing to test in a sandbox account.
 
 ## Deliberately left out
 
@@ -190,6 +249,8 @@ There are two runner projects (`deploy/codebuild/runners.tf`), split by how much
 | Infrastructure pipelines (Terraform plan on PR, apply on merge) | Separate concern, separate roles. Mixing them would give the app deploy roles infrastructure rights. |
 | E2E browser tests (Playwright) against staging | Valuable, but the sample app has no user flows. The hook point is after the staging smoke test, before the production approval. |
 | Pruning old frontend assets | Kept on purpose for rollback and for clients with an old `index.html` cached. A scheduled job could remove assets not referenced by the last N releases. |
+| Buildx layer cache in ECR (`type=registry`) instead of the GitHub cache | It would keep layer caching inside AWS too. It needs separate cache repositories for CI and release, so PR layers can't seed release images. Worth doing if `gha` cache traffic becomes significant. |
+| Sending PR failures to DevOps Agent | Most PR failures are an author's own test or lint error, and investigations count against a monthly quota. Only `main` release and rollback failures are sent. A production approval that is *rejected* also marks the run failed and starts an unnecessary investigation. Accepted as rare. |
 | Image signing (cosign) + admission check on the instance | Provenance is already attached. Verifying a signature in `deploy.sh` is the next supply-chain step. |
 | Dependabot / Renovate config | Needed to keep the SHA-pinned actions, the base image digest and npm deps current. Omitted only to keep the submission small. |
 | Notifications (Slack / Teams on failure or approval) | Organisation-specific. GitHub already notifies on failed runs and pending approvals. |
