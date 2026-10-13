@@ -23,6 +23,7 @@ src/problem4/
 │   ├── _deploy-frontend.yml    reusable: two-phase publish + smoke test + auto-rollback
 │   ├── _investigate-failure.yml reusable: hand a failed release to AWS DevOps Agent
 │   └── security.yml            gitleaks (history), dependency review, weekly re-scan
+├── docs/                       pipeline diagrams (PNG) and the script that draws them
 ├── backend/                    sample Express API (/healthz reports the deployed SHA), tests, Dockerfile
 ├── frontend/                   sample SPA with a content-hashing build, tests
 ├── scripts/                    CI-side deploy, publish and smoke-test scripts
@@ -53,23 +54,11 @@ src/problem4/
 
 ## Pipelines
 
-```mermaid
-flowchart LR
-  subgraph Backend
-    bpr[PR] --> bci[lint · test · audit<br/>image build · Trivy]
-    bm[push main] --> bgate[same gate] --> bbuild[build once → ECR<br/>scan pushed digest]
-    bbuild --> bstg[staging<br/>rolling deploy · smoke]
-    bstg --> bappr{{approval}} --> bprod[production<br/>rolling deploy · smoke]
-    bbuild & bstg & bprod -. failure .-> bagent[AWS DevOps Agent<br/>investigation]
-  end
-  subgraph Frontend
-    fpr[PR] --> fci[lint · test · audit · build]
-    fm[push main] --> fbuild[gate + build once<br/>artifact frontend-dist-SHA]
-    fbuild --> fstg[staging<br/>archive · publish · smoke]
-    fstg --> fappr{{approval}} --> fprod[production<br/>publish · smoke]
-    fbuild & fstg & fprod -. failure .-> fagent[AWS DevOps Agent<br/>investigation]
-  end
-```
+![Backend pipeline: GitHub Actions on CodeBuild runners builds one image into ECR, then SSM rolls it across the staging and production EC2 Auto Scaling groups behind an ALB](docs/pipeline-backend.png)
+
+![Frontend pipeline: GitHub Actions on CodeBuild runners builds one bundle, archives it in S3, then publishes it to the staging and production site buckets behind CloudFront](docs/pipeline-frontend.png)
+
+Solid arrows are the release path, green arrows are gates ("main only", "smoke OK"), orange dotted arrows are dependency-cache reads, and red dashed arrows go to AWS DevOps Agent when a stage fails. The diagrams are generated from `docs/pipeline_diagram.py` (the Python [`diagrams`](https://diagrams.mingrammer.com/) library, official AWS and GitHub icons). The library has no DevOps Agent icon yet, so the DevOps Guru icon stands in for it.
 
 ### Backend → EC2
 
