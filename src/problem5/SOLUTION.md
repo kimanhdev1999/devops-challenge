@@ -38,6 +38,7 @@ Editable source: [`diagrams/fortified-castle.drawio`](diagrams/fortified-castle.
 | Insider (engineer or operator) | Edit balances, inject fills, steal keys | S7, S11, S13, S14, S15, S17, dual control |
 | Compromised CI or dependency | Ship a backdoored image to the engine or the withdrawal service | S16 |
 | Compromised cloud credentials | Disable logging, exfiltrate data, create resources | S14 (SCPs), S15 (immutable logs), S9 |
+| Prompt injection through telemetry | Hide attacker-controlled text (User-Agent, client order IDs, withdrawal memos) in logs to steer the AI ops agent | S18 (read-only, no custody, human approval) |
 
 ---
 
@@ -120,7 +121,28 @@ The trade-off is speed for the rare large withdrawal: if it exceeds the hot floa
 | --- | --- | --- |
 | **S15** [ADDED] | **Log archive account:** organisation-wide **CloudTrail** (management + S3/KMS data events), VPC Flow Logs, EKS audit logs, WAF logs and Session Manager logs. All go to S3 with **Object Lock**, readable only by the security team. | Attackers or insiders covering their tracks; forensic gaps |
 | **S14** (security account) | **GuardDuty** (including EKS audit-log and runtime monitoring, S3 and RDS protection), **Security Hub** (FSBP and CIS standards), **Config** conformance packs, **Inspector** (ECR and EC2), and **Detective** for investigation. Delegated admin lives in the security account, so prod admins can't silence findings. Critical findings page on-call; withdrawal-related findings also trigger the withdrawal circuit breaker. | Undetected compromise; configuration drift |
+| **S18** [ADDED] | **AWS DevOps Agent for operational diagnosis**, plus **SLOs for the security controls** (below). The Agent Space lives in the shared services account. Its role in prod is read-only and explicitly denies `secretsmanager:GetSecretValue`, `kms:Decrypt`, reads of the KYC and snapshot buckets, and database connections. It has **no access to the custody account**. Custody exports only aggregate metrics (queue depth, approval latency) through CloudWatch cross-account observability. No write-capable MCP tools are connected. The agent's findings never trigger automation: for example, it can't resume halted withdrawals. Its API calls land in the org CloudTrail (S15). | A slow, guesswork diagnosis while withdrawals are halted or an SLO is burning. Also limits the AI agent's own risks: an LLM reading attacker-influenced logs can be wrong or manipulated, so it can only advise. |
 | — [ADDED] | **Runbooks and game days:** key compromise, API-key leak, a suspicious-withdrawal spike, a reconciler mismatch, and region failover. **Break-glass:** two sealed IAM Identity Center emergency accounts with hardware MFA, alarmed on use. | Slow, improvised incident response |
+
+### Security SLOs and AI-assisted diagnosis (S18)
+
+Problem 1 sets SLOs for trading. The security controls need their own, because a control that is silently slow is effectively off. A reconciler running 10 minutes behind is 10 minutes of withdrawable forged balance.
+
+| Control | SLI: good event | SLO (28 days) | Why |
+| --- | --- | --- | --- |
+| Reconciler (S11) | A minute in which reconciliation lags fills by less than 60 s | 99.9% | Caps how long a forged credit can go unnoticed |
+| Withdrawals (S13) | A withdrawal within the hot float that is screened, signed and broadcast within 15 min. Policy holds such as new-address delays and dual approval don't count. | 99% | Customers can always exit. Halts and holds are deliberate, but slowness isn't. |
+| Detection (S14) | A critical GuardDuty or Security Hub finding that pages on-call within 5 min. Measured with sample findings generated hourly as canaries. | 99.9% | Proves the detection pipeline works end to end, not just that it's switched on |
+| Audit trail (S15) | A CloudTrail log file delivered to the log archive within 15 min | 99.9% | A gap in the trail is a forensic blind spot |
+
+These use the same burn-rate alerting as Problem 1. When one burns, or the reconciler or a balance alarm halts withdrawals, an **AWS DevOps Agent** investigation starts with the page. The agent looks for the *operational* cause: for example, ledger projector lag behind the reconciler, a blockchain node provider timing out, Network Firewall blocking a provider's new endpoint, or a deploy that changed the screening client. On-call can then fix it and an authorised human can resume withdrawals sooner. Security incidents stay with GuardDuty, Detective and the security team. The agent is an ops tool, not part of incident response for attacks.
+
+Why the agent is trusted this far and no further:
+
+- **Read-only, with human approval.** The service blocks write operations at its tool layer, and any proposed mitigation needs explicit approval. On top of that, our IAM denies keys, secrets and customer data, so even a manipulated agent has nothing valuable to read and nothing to change.
+- **Untrusted input.** Logs carry attacker-controlled strings, and the agent can be wrong. Its findings are labelled root cause, contributing cause or hypothesis, with evidence. Humans verify them before acting, and nothing automated keys off its output.
+- **No custody.** Key handling stays an AI-free zone. Custody is investigated by the custody team from its own logs, and the agent sees only aggregate metrics.
+- **Data.** Logs are PII-free at the source, which was already needed for S15. AWS states that agent data isn't used to train models, and investigation history is kept for audit.
 
 ### CI/CD supply chain
 
@@ -168,7 +190,7 @@ These aren't negotiable for launch, because a gap in any of them can lose custom
 
 | Phase | Items | Reasoning |
 | --- | --- | --- |
-| **Must-have before launch** | Everything in the list above, plus S5, S6, S8, S9, S10, S12, S17, GuardDuty, Security Hub, Config, runbooks and break-glass | These protect funds, ledger integrity and detection, and are cheap compared with a breach |
+| **Must-have before launch** | Everything in the list above, plus S5, S6, S8, S9, S10, S12, S17, GuardDuty, Security Hub, Config, runbooks and break-glass, and the security SLOs with burn-rate alerts and DevOps Agent investigations (S18) | These protect funds, ledger integrity and detection, and are cheap compared with a breach |
 | **Phase 2 (first 3–6 months)** | Market-maker mTLS rollout to all API clients (S3 is offered from day one, mandatory later); PII tokenisation vault; Macie on KYC buckets; Detective-driven threat hunting; external pentest and bug bounty; SOC 2 / ISO 27001 readiness; chaos and security game days in prod | Valuable, but they depend on traffic patterns, partners and volume we don't know yet |
 | **Deferred** | Service-mesh mTLS inside the cluster (R1); active-active regions (R2); a dedicated 24/7 SOC (use an MDR partner first); proof-of-reserves publication tooling | Either cost latency on the hot path, conflict with correctness, or are only needed at a larger scale |
 
